@@ -21,15 +21,32 @@ class ChatCompletionRequest(BaseModel):
         return ""
 
 
+class EntityItem(BaseModel):
+    text: str
+    label: str
+
+
+class ExtractedFeatures(BaseModel):
+    intent: str
+    entities: list[EntityItem]
+    embedding_dim: int
+    embedding_sample: list[float]
+
+
 class GatewayTelemetry(BaseModel):
     cache_status: Literal["HIT", "MISS", "BYPASS"]
     gateway_mode: str
     total_latency_ms: float
+    feature_extraction_ms: float = 0.0
     cache_lookup_ms: float = 0.0
     llm_upstream_ms: float = 0.0
+    matched_message_id: Optional[str] = None
+    similarity_score: Optional[float] = None
+    applied_threshold: Optional[float] = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
     estimated_cost_saved: bool = False
+    extracted_features: Optional[ExtractedFeatures] = None
 
 
 class ChatCompletionResponse(BaseModel):

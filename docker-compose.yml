@@ -1,0 +1,37 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: gateway-neo4j
+    ports:
+      - "7474:7474"   # Neo4j Browser (Graf görselleştirme arayüzü)
+      - "7687:7687"   # Bolt protokolü (Uygulama bağlantısı)
+    environment:
+      - NEO4J_AUTH=neo4j/password123
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1G
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: gateway-redis
+    ports:
+      - "6379:6379"
+    # Keyspace notifications (Ex): Anahtar süresi dolduğunda Neo4j senkronizasyonu için olay yayınlar
+    command: redis-server --appendonly yes --notify-keyspace-events Ex
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  neo4j_data:
+  redis_data:
