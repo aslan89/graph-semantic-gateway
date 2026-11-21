@@ -41,10 +41,11 @@ class GatewayRouter:
         prompt: str,
         embedding: list[float],
         features: ExtractedFeatures,
+        active_mode: str,
     ) -> Optional[dict]:
         """
         1) Neo4j hibrit Cypher sorgusu ile yapısal/vektörel eşleşmeyi doğrular.
-        2) Eşleşme bulunursa Redis üzerinden milisaniyeler içinde yanıtı çeker[cite: 1].
+        2) Eşleşme bulunursa Redis üzerinden milisaniyeler içinde yanıtı çeker.
         3) Self-healing: Neo4j kaydı var ancak Redis anahtarı yoksa yetim düğümü temizler.
         """
         match_info = await self.neo4j_client.find_semantic_match(
@@ -52,7 +53,7 @@ class GatewayRouter:
             embedding=embedding,
             intent=features.intent,
             entities=features.entities,
-            mode=settings.gateway_mode,
+            mode=active_mode,
         )
         if not match_info:
             return None
@@ -84,7 +85,7 @@ class GatewayRouter:
     ) -> None:
         """
         Cache Miss sonrasında kullanıcıya yanıt dönülürken arka planda
-        önce Redis'e yanıtı, ardından Neo4j'ye graf düğümlerini kaydeder[cite: 1].
+        önce Redis'e yanıtı, ardından Neo4j'ye graf düğümlerini kaydeder.
         """
         message_id = uuid.uuid4().hex
         try:
@@ -96,12 +97,6 @@ class GatewayRouter:
                 intent=features.intent,
                 entities=features.entities,
             )
-            logger.info(
-                "Önbelleğe yazıldı | id=%s | intent=%s | entities=%s",
-                message_id,
-                features.intent,
-                [e.text for e in features.entities],
-            )
         except Exception as exc:
             logger.error("Arka plan önbellek kaydı başarısız: %s", str(exc))
 
@@ -109,12 +104,15 @@ class GatewayRouter:
         self,
         request: ChatCompletionRequest,
         background_tasks: BackgroundTasks,
+        mode_override: Optional[str] = None,
+        skip_cache_write: bool = False,
     ) -> ChatCompletionResponse:
         total_start = time.perf_counter()
         prompt = request.extract_latest_user_prompt()
+        active_mode = mode_override or settings.gateway_mode
 
         # 1. Passthrough (Önbelleksiz Baseline) Modu
-        if settings.gateway_mode == "passthrough":
+        if active_mode == "passthrough":
             llm_result = await self.llm_client.generate_completion(request)
             total_ms = (time.perf_counter() - total_start) * 1000
             return ChatCompletionResponse(
@@ -123,7 +121,7 @@ class GatewayRouter:
                 content=llm_result["content"],
                 telemetry=GatewayTelemetry(
                     cache_status="BYPASS",
-                    gateway_mode=settings.gateway_mode,
+                    gateway_mode=active_mode,
                     total_latency_ms=round(total_ms, 2),
                     llm_upstream_ms=llm_result["upstream_latency_ms"],
                     prompt_tokens=llm_result["prompt_tokens"],
@@ -132,12 +130,17 @@ class GatewayRouter:
                 ),
             )
 
-        # 2. Paralel Özellik Çıkarımı (Embedding + Intent/Entity)[cite: 1]
+        # 2. Paralel Özellik Çıkarımı (Embedding + Intent/Entity)
         embedding, features, extract_ms = await self.feature_extractor.extract(prompt)
 
-        # 3. Hibrit Neo4j + Redis Önbellek Sorgusu[cite: 1]
+        # 3. Hibrit Neo4j + Redis Önbellek Sorgusu
         lookup_start = time.perf_counter()
-        cache_hit_data = await self._lookup_semantic_cache(prompt, embedding, features)
+        cache_hit_data = await self._lookup_semantic_cache(
+            prompt=prompt,
+            embedding=embedding,
+            features=features,
+            active_mode=active_mode,
+        )
         lookup_ms = (time.perf_counter() - lookup_start) * 1000
 
         # 4. Cache Hit Durumu
@@ -149,7 +152,7 @@ class GatewayRouter:
                 content=cache_hit_data["answer"],
                 telemetry=GatewayTelemetry(
                     cache_status="HIT",
-                    gateway_mode=settings.gateway_mode,
+                    gateway_mode=active_mode,
                     total_latency_ms=round(total_ms, 2),
                     feature_extraction_ms=extract_ms,
                     cache_lookup_ms=round(lookup_ms, 2),
@@ -164,13 +167,14 @@ class GatewayRouter:
 
         # 5. Cache Miss Durumu
         llm_result = await self.llm_client.generate_completion(request)
-        background_tasks.add_task(
-            self._persist_cache_async,
-            prompt=prompt,
-            answer=llm_result["content"],
-            embedding=embedding,
-            features=features,
-        )
+        if not skip_cache_write:
+            background_tasks.add_task(
+                self._persist_cache_async,
+                prompt=prompt,
+                answer=llm_result["content"],
+                embedding=embedding,
+                features=features,
+            )
 
         total_ms = (time.perf_counter() - total_start) * 1000
         return ChatCompletionResponse(
@@ -179,7 +183,7 @@ class GatewayRouter:
             content=llm_result["content"],
             telemetry=GatewayTelemetry(
                 cache_status="MISS",
-                gateway_mode=settings.gateway_mode,
+                gateway_mode=active_mode,
                 total_latency_ms=round(total_ms, 2),
                 feature_extraction_ms=extract_ms,
                 cache_lookup_ms=round(lookup_ms, 2),

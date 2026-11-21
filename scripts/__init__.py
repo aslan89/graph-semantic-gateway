@@ -1,0 +1,1 @@
+"""QQP ETL ve deney simülasyon betikleri."""

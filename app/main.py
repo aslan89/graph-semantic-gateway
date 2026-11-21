@@ -1,7 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Optional
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response
 from app.clients.llm_proxy import LLMProxyClient
 from app.clients.neo4j_graph import Neo4jGraphClient
 from app.clients.redis_cache import RedisCacheClient
@@ -10,24 +11,22 @@ from app.schemas import ChatCompletionRequest, ChatCompletionResponse
 from app.services.feature_extractor import FeatureExtractor
 from app.services.gateway_router import GatewayRouter
 
+ALLOWED_MODES = {"hybrid", "vector_only", "passthrough"}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Katman 2 modellerini belleğe yükle
     feature_extractor = FeatureExtractor()
     await asyncio.to_thread(feature_extractor.load_models)
 
-    # 2. Katman 3 (Neo4j) ve Katman 4 (Redis) istemcilerini başlat
     neo4j_client = Neo4jGraphClient()
     await neo4j_client.initialize_schema()
     redis_client = RedisCacheClient()
 
-    # 3. Redis TTL süresi dolduğunda Neo4j düğümünü temizleyen arka plan görevini başlat
     ttl_sync_task = asyncio.create_task(
         redis_client.listen_expired_events(neo4j_client.delete_message_node)
     )
 
-    # 4. Kalıcı HTTP havuzu ve GatewayRouter kurulumu
     limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
     timeout = httpx.Timeout(settings.llm_timeout_seconds)
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as http_client:
@@ -48,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -72,14 +71,30 @@ async def chat_completions(
     request: ChatCompletionRequest,
     background_tasks: BackgroundTasks,
     response: Response,
+    x_gateway_mode: Optional[str] = Header(default=None),
+    x_skip_cache_write: Optional[str] = Header(default=None),
     router: GatewayRouter = Depends(get_gateway_router),
 ):
     if not request.extract_latest_user_prompt():
         raise HTTPException(status_code=400, detail="En az bir 'user' mesajı gereklidir.")
 
+    if x_gateway_mode and x_gateway_mode not in ALLOWED_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Geçersiz X-Gateway-Mode. İzin verilenler: {sorted(ALLOWED_MODES)}",
+        )
+
+    skip_write = (x_skip_cache_write or "").lower() in {"1", "true", "yes"}
+
     try:
-        result = await router.handle_chat_completion(request, background_tasks)
+        result = await router.handle_chat_completion(
+            request=request,
+            background_tasks=background_tasks,
+            mode_override=x_gateway_mode,
+            skip_cache_write=skip_write,
+        )
         response.headers["X-Cache-Status"] = result.telemetry.cache_status
+        response.headers["X-Gateway-Mode"] = result.telemetry.gateway_mode
         response.headers["X-Total-Latency-Ms"] = str(result.telemetry.total_latency_ms)
         response.headers["X-Cache-Lookup-Ms"] = str(result.telemetry.cache_lookup_ms)
         if result.telemetry.similarity_score is not None:
